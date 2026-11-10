@@ -10,7 +10,8 @@ Full state observed, no rendering in the env. Run tests with `uv run --extra viz
 - `src/sheepdog/jax_env.py`: JAX port of `dynamics.py` (reset/step/step_autoreset/flat_obs), for batched
   GPU training. Keep the two in sync; `tests/test_jax_env.py` checks they match with noise off.
 - `scripts/intrinsic_ppo.py`: URL baselines, PPO on an intrinsic reward only (`--bonus icm|rnd`), plus
-  `--random-policy` chance baseline. Env overrides via `--env key=value`. Outputs to `outputs/intrinsic_ppo/`.
+  `--random-policy` chance baseline; phase 2 fine-tuning via `--reward task [--init params.pkl]`. Env overrides
+  via `--env key=value`. Outputs to `outputs/intrinsic_ppo/`. `scripts/compare_runs.py` tabulates/plots runs.
 - `src/sheepdog/viz.py` (opt-in, `viz` extra): `record` an episode, then `plot_trajectory` (PNG) / `animate` (GIF).
   Demo: `uv run --extra viz scripts/visualize.py`; outputs go to `outputs/` (gitignored).
 

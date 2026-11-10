@@ -9,6 +9,11 @@ Bonuses (--bonus):
        dog/sheep positions; its error is the reward.
 --random-policy skips training and logs the same diagnostics for uniform random actions (chance baseline).
 
+Phase 2 (fine-tuning on the task):
+  --reward task      reward 1 when all sheep reach the goal (episodic returns), no bonus
+  --init PATH        start the policy from a pretrained params.pkl (the value net is re-initialised,
+                     since the pretrained one estimated intrinsic returns)
+
 Both bonuses are trained on the policy's own data, rescaled by a running std, and treated as
 non-episodic (returns ignore episode ends, as in RND). Transitions that end in an auto-reset get no
 bonus and are not used to train the bonus model: their "next state" is a random new start, and
@@ -22,7 +27,8 @@ Logged diagnostics (not used for training):
 Run on a GPU node:
     uv run --extra viz python scripts/intrinsic_ppo.py --bonus icm --env noise_std=0
     uv run --extra viz python scripts/intrinsic_ppo.py --random-policy --env noise_std=0
-Outputs (metrics.csv, params.pkl, example episodes as .npz/.png/.gif) go to outputs/intrinsic_ppo/<tag>-<time>/.
+    uv run --extra viz python scripts/intrinsic_ppo.py --reward task --init outputs/.../params.pkl --env noise_std=0
+Outputs (metrics.csv, params.pkl, example episodes as .npz/.png/.gif) go to outputs/intrinsic_ppo/<tag>-s<seed>-<time>/.
 """
 
 import argparse
@@ -47,7 +53,9 @@ BONUSES = ("icm", "rnd")
 
 @dataclass
 class Args:
-    bonus: str = "icm"  # one of BONUSES
+    reward: str = "intrinsic"  # "intrinsic" (bonus only) or "task" (1 when all sheep reach the goal)
+    bonus: str = "icm"  # one of BONUSES (used when reward == "intrinsic")
+    init: str = ""  # params.pkl of a previous run to start the policy from
     random_policy: bool = False
     seed: int = 0
     total_steps: int = 20_000_000
@@ -177,6 +185,8 @@ def make_train(args: Args, cfg: SheepdogConfig):
             "v": mlp_init(k_v, [obs_dim, h, h, 1], last_scale=1.0),
             "log_std": jnp.zeros(act_dim),
         }
+        if args.init:
+            params = load_pretrained_policy(args.init, params)
         bonus_train, bonus_fixed = bonus_init(k_bonus)
         env_state = env_reset(jax.random.split(k_env, N))
         return {
@@ -228,18 +238,26 @@ def make_train(args: Args, cfg: SheepdogConfig):
         valid = (~tr["done"]).astype(jnp.float32)
         r_raw = bonus_error(c["bonus_train"], c["bonus_fixed"], tr["obs"], tr["action"], tr["next_obs"]) * valid
         rew_stats = update_stats(c["rew_stats"], r_raw, valid)
-        r = r_raw / jnp.sqrt(rew_stats[1] + 1e-8)
+        if args.reward == "task":
+            # Sparse task reward, episodic returns. Time-limit ends are treated as terminal too
+            # (the env auto-resets, so there is no terminal obs to bootstrap from).
+            r = tr["success"].astype(jnp.float32)
+            nonterminal = valid
+        else:
+            # Intrinsic reward, non-episodic returns (ignore episode boundaries, as in RND).
+            r = r_raw / jnp.sqrt(rew_stats[1] + 1e-8)
+            nonterminal = jnp.ones_like(valid)
 
-        # 3. Non-episodic GAE (intrinsic returns ignore episode boundaries).
+        # 3. GAE.
         _, _, last_v = policy(c["params"], obs)
 
         def gae_step(carry, x):
             adv, next_v = carry
-            r_t, v_t = x
-            adv = r_t + args.gamma * next_v - v_t + args.gamma * args.gae_lambda * adv
+            r_t, v_t, nt = x
+            adv = r_t + args.gamma * next_v * nt - v_t + args.gamma * args.gae_lambda * nt * adv
             return (adv, v_t), adv
 
-        _, adv = jax.lax.scan(gae_step, (jnp.zeros(N), last_v), (r, tr["value"]), reverse=True)
+        _, adv = jax.lax.scan(gae_step, (jnp.zeros(N), last_v), (r, tr["value"], nonterminal), reverse=True)
         batch = {
             "obs": tr["obs"], "action": tr["action"], "logp": tr["logp"], "adv": adv,
             "ret": adv + tr["value"], "next_obs": tr["next_obs"], "valid": valid,
@@ -308,6 +326,18 @@ def make_train(args: Args, cfg: SheepdogConfig):
     return init, update, policy
 
 
+def load_pretrained_policy(path, params):
+    """Take the policy (pi, log_std) from a saved params.pkl; keep the freshly initialised value net."""
+    with open(path, "rb") as fh:
+        loaded = pickle.load(fh)
+    for k in ("pi", "log_std"):
+        want = jax.tree.map(jnp.shape, params[k])
+        got = jax.tree.map(jnp.shape, loaded[k])
+        if want != got:
+            raise ValueError(f"{path}: {k} shapes {got} don't match this config {want} (same --env and --hidden?)")
+    return {**params, "pi": jax.tree.map(jnp.asarray, loaded["pi"]), "log_std": jnp.asarray(loaded["log_std"])}
+
+
 def record_episodes(cfg, policy, params, key, n, random_policy=False):
     """Roll out the (stochastic) policy without auto-reset; return viz-compatible dicts."""
 
@@ -360,6 +390,8 @@ def parse_args():
     args = Args(**ns)
     if args.bonus not in BONUSES:
         p.error(f"--bonus must be one of {BONUSES}")
+    if args.reward not in ("intrinsic", "task"):
+        p.error("--reward must be 'intrinsic' or 'task'")
     cfg_types = {f.name: f.type for f in fields(SheepdogConfig)}
     overrides = {}
     for kv in env_overrides:
@@ -372,8 +404,13 @@ def parse_args():
 
 def main():
     args, cfg = parse_args()
-    tag = "random" if args.random_policy else args.bonus
-    run_dir = Path(args.out) / f"{tag}-{time.strftime('%Y%m%d-%H%M%S')}"
+    if args.random_policy:
+        tag = "random"
+    elif args.reward == "task":
+        tag = "task-ft" if args.init else "task-scratch"
+    else:
+        tag = args.bonus
+    run_dir = Path(args.out) / f"{tag}-s{args.seed}-{time.strftime('%Y%m%d-%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "args.json").write_text(json.dumps({"args": asdict(args), "env": asdict(cfg)}, indent=2))
     print(f"devices: {jax.devices()}\nrun dir: {run_dir}")
