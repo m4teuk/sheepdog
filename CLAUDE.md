@@ -9,7 +9,8 @@ Full state observed, no rendering in the env. Run tests with `uv run --extra viz
 - `src/sheepdog/env.py`: thin Gymnasium wrapper (`SheepdogEnv`, id `Sheepdog-v0`).
 - `src/sheepdog/jax_env.py`: JAX port of `dynamics.py` (reset/step/step_autoreset/flat_obs), for batched
   GPU training. Keep the two in sync; `tests/test_jax_env.py` checks they match with noise off.
-- `scripts/rnd_ppo.py`: first URL baseline, PPO on an RND novelty reward only. Outputs to `outputs/rnd_ppo/<run>/`.
+- `scripts/intrinsic_ppo.py`: URL baselines, PPO on an intrinsic reward only (`--bonus icm|rnd`), plus
+  `--random-policy` chance baseline. Env overrides via `--env key=value`. Outputs to `outputs/intrinsic_ppo/`.
 - `src/sheepdog/viz.py` (opt-in, `viz` extra): `record` an episode, then `plot_trajectory` (PNG) / `animate` (GIF).
   Demo: `uv run --extra viz scripts/visualize.py`; outputs go to `outputs/` (gitignored).
 

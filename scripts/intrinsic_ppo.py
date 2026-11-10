@@ -1,17 +1,28 @@
-"""Unsupervised exploration on Sheepdog: PPO trained only on an RND novelty bonus.
+"""Unsupervised exploration on Sheepdog: PPO trained only on an intrinsic bonus (no task reward).
 
-The agent never sees a task reward. RND (Burda et al. 2018): a fixed random network maps the
-state to features; a predictor network learns to match them; the prediction error (large for
-rarely seen states) is the reward. Intrinsic returns are non-episodic, as in the RND paper.
+Bonuses (--bonus):
+  icm  Curiosity (forward-model error). A model predicts the change in dog/sheep positions from
+       (dog/sheep positions, sheep velocity, action); its squared error is the reward. Simplest
+       ICM variant: raw state instead of learned features, no inverse model (Burda et al. 2018,
+       "Large-Scale Study of Curiosity-Driven Learning").
+  rnd  Novelty (Burda et al. 2018, RND). A predictor learns to match a fixed random network on
+       dog/sheep positions; its error is the reward.
+--random-policy skips training and logs the same diagnostics for uniform random actions (chance baseline).
+
+Both bonuses are trained on the policy's own data, rescaled by a running std, and treated as
+non-episodic (returns ignore episode ends, as in RND). Transitions that end in an auto-reset get no
+bonus and are not used to train the bonus model: their "next state" is a random new start, and
+rewarding that would reward ending episodes (i.e. leak the task reward via success resets).
 
 Logged diagnostics (not used for training):
   success  - of all episodes finished since the last log line, the fraction that ended at the goal
+  near     - fraction of steps with a dog within flee_radius of a sheep (is the dog seeking sheep?)
   sheep_mv / dog_mv - how far sheep / dog moved over one rollout segment (arena units)
 
 Run on a GPU node:
-    uv run --extra viz python scripts/rnd_ppo.py
-    uv run --extra viz python scripts/rnd_ppo.py --env noise_std=0 n_sheep=3   # env overrides
-Outputs (metrics.csv, params.pkl, example episodes as .npz/.png/.gif) go to outputs/rnd_ppo/<run>/.
+    uv run --extra viz python scripts/intrinsic_ppo.py --bonus icm --env noise_std=0
+    uv run --extra viz python scripts/intrinsic_ppo.py --random-policy --env noise_std=0
+Outputs (metrics.csv, params.pkl, example episodes as .npz/.png/.gif) go to outputs/intrinsic_ppo/<tag>-<time>/.
 """
 
 import argparse
@@ -31,9 +42,13 @@ import optax
 from sheepdog import SheepdogConfig
 from sheepdog import jax_env as E
 
+BONUSES = ("icm", "rnd")
+
 
 @dataclass
 class Args:
+    bonus: str = "icm"  # one of BONUSES
+    random_policy: bool = False
     seed: int = 0
     total_steps: int = 20_000_000
     num_envs: int = 1024
@@ -49,13 +64,13 @@ class Args:
     update_epochs: int = 4
     num_minibatches: int = 32
     hidden: int = 256
-    # RND
-    rnd_lr: float = 3e-4
+    # bonus model
+    bonus_lr: float = 3e-4
     rnd_dim: int = 128
     # output
     log_every: int = 5
     n_eval_episodes: int = 4
-    out: str = "outputs/rnd_ppo"
+    out: str = "outputs/intrinsic_ppo"
 
 
 # --- tiny MLP library -------------------------------------------------------------------
@@ -81,13 +96,59 @@ def gauss_logp(a, mean, log_std):
     return (-0.5 * ((a - mean) / jnp.exp(log_std)) ** 2 - log_std - 0.5 * jnp.log(2 * jnp.pi)).sum(-1)
 
 
-def update_stats(stats, x):
-    """Running mean/var (parallel Welford) of all values in x."""
+def update_stats(stats, x, w):
+    """Running mean/var (parallel Welford) of the values in x with weight w (0/1 mask)."""
     mean, var, count = stats
-    b_mean, b_var, b_count = x.mean(), x.var(), x.size
+    b_count = w.sum()
+    b_mean = (w * x).sum() / jnp.maximum(b_count, 1)
+    b_var = (w * (x - b_mean) ** 2).sum() / jnp.maximum(b_count, 1)
     delta, tot = b_mean - mean, count + b_count
     m2 = var * count + b_var * b_count + delta**2 * count * b_count / tot
     return mean + delta * b_count / tot, m2 / tot, tot
+
+
+# --- intrinsic bonuses ------------------------------------------------------------------
+# init(key) -> (trainable params, fixed params)
+# error(trainable, fixed, obs, action, next_obs) -> per-transition error = bonus (before scaling)
+
+
+def make_bonus(kind: str, cfg: SheepdogConfig, hidden: int, rnd_dim: int):
+    D, S, L, h = cfg.n_dogs, cfg.n_sheep, cfg.arena_size, hidden
+    pos_dim = 2 * (D + S)  # flat_obs layout: [dogs, sheep, sheep_vel, goal]
+    state_dim = 2 * D + 4 * S  # positions + sheep velocities (no goal)
+    act_dim = 2 * D
+    relu = jax.nn.relu
+
+    if kind == "rnd":
+
+        def init(key):
+            k1, k2 = jax.random.split(key)
+            return mlp_init(k1, [pos_dim, h, h, rnd_dim]), mlp_init(k2, [pos_dim, h, h, rnd_dim])
+
+        def error(train, fixed, obs, act, next_obs):
+            x = next_obs[..., :pos_dim]
+            return ((mlp(train, x, relu) - mlp(fixed, x, relu)) ** 2).mean(-1)
+
+    elif kind == "icm":
+        # Predict position deltas in units of "one full-speed step", so dog and sheep errors are comparable.
+        max_step = jnp.concatenate(
+            [
+                jnp.full(2 * D, 2 * cfg.dog_max_speed * cfg.dt / L),
+                jnp.full(2 * S, 2 * cfg.sheep_max_speed * cfg.dt / L),
+            ]
+        )
+
+        def init(key):
+            return mlp_init(key, [state_dim + act_dim, h, h, pos_dim]), {}
+
+        def error(train, fixed, obs, act, next_obs):
+            x = jnp.concatenate([obs[..., :state_dim], jnp.clip(act, -1.0, 1.0)], axis=-1)
+            target = (next_obs[..., :pos_dim] - obs[..., :pos_dim]) / max_step
+            return ((mlp(train, x, relu) - target) ** 2).mean(-1)
+
+    else:
+        raise ValueError(f"unknown bonus {kind!r}")
+    return init, error
 
 
 # --- training ---------------------------------------------------------------------------
@@ -95,39 +156,35 @@ def update_stats(stats, x):
 
 def make_train(args: Args, cfg: SheepdogConfig):
     N, T = args.num_envs, args.num_steps
-    obs_dim, act_dim = E.obs_size(cfg), 2 * cfg.n_dogs
-    rnd_in = 2 * (cfg.n_dogs + cfg.n_sheep)  # RND sees dog + sheep positions only
     D, S, L = cfg.n_dogs, cfg.n_sheep, cfg.arena_size
+    obs_dim, act_dim = E.obs_size(cfg), 2 * D
 
     env_reset = jax.vmap(partial(E.reset, cfg))
     env_step = jax.vmap(partial(E.step_autoreset, cfg))
     env_obs = jax.vmap(partial(E.flat_obs, cfg))
     opt = optax.chain(optax.clip_by_global_norm(args.max_grad_norm), optax.adam(args.lr, eps=1e-5))
-    rnd_opt = optax.adam(args.rnd_lr)
+    bonus_opt = optax.adam(args.bonus_lr)
+    bonus_init, bonus_error = make_bonus(args.bonus, cfg, args.hidden, args.rnd_dim)
 
     def policy(params, obs):
         return mlp(params["pi"], obs), params["log_std"], mlp(params["v"], obs)[..., 0]
 
-    def rnd_error(pred, target, x):
-        relu = jax.nn.relu
-        return ((mlp(pred, x, relu) - jax.lax.stop_gradient(mlp(target, x, relu))) ** 2).mean(-1)
-
     def init(key):
-        k_pi, k_v, k_pred, k_tgt, k_env, key = jax.random.split(key, 6)
+        k_pi, k_v, k_bonus, k_env, key = jax.random.split(key, 5)
         h = args.hidden
         params = {
             "pi": mlp_init(k_pi, [obs_dim, h, h, act_dim], last_scale=0.01),
             "v": mlp_init(k_v, [obs_dim, h, h, 1], last_scale=1.0),
             "log_std": jnp.zeros(act_dim),
         }
-        rnd_pred = mlp_init(k_pred, [rnd_in, h, h, args.rnd_dim])
+        bonus_train, bonus_fixed = bonus_init(k_bonus)
         env_state = env_reset(jax.random.split(k_env, N))
         return {
             "params": params,
             "opt_state": opt.init(params),
-            "rnd_pred": rnd_pred,
-            "rnd_opt_state": rnd_opt.init(rnd_pred),
-            "rnd_target": mlp_init(k_tgt, [rnd_in, h, h, args.rnd_dim]),
+            "bonus_train": bonus_train,
+            "bonus_fixed": bonus_fixed,
+            "bonus_opt_state": bonus_opt.init(bonus_train),
             "env_state": env_state,
             "obs": env_obs(env_state),
             "rew_stats": (jnp.float32(0.0), jnp.float32(1.0), jnp.float32(1e-4)),
@@ -143,6 +200,10 @@ def make_train(args: Args, cfg: SheepdogConfig):
         ent = (log_std + 0.5 * jnp.log(2 * jnp.pi * jnp.e)).sum()
         return pg + args.vf_coef * vl - args.ent_coef * ent, (pg, vl, ent)
 
+    def bonus_loss(train, fixed, mb):
+        err = bonus_error(train, fixed, mb["obs"], mb["action"], mb["next_obs"])
+        return (err * mb["valid"]).sum() / jnp.maximum(mb["valid"].sum(), 1)
+
     @jax.jit
     def update(c):
         # 1. Rollout.
@@ -150,7 +211,10 @@ def make_train(args: Args, cfg: SheepdogConfig):
             env_state, obs, key = carry
             key, k_a, k_e = jax.random.split(key, 3)
             mean, log_std, v = policy(c["params"], obs)
-            a = mean + jnp.exp(log_std) * jax.random.normal(k_a, mean.shape)
+            if args.random_policy:
+                a = jax.random.uniform(k_a, mean.shape, minval=-1.0, maxval=1.0)
+            else:
+                a = mean + jnp.exp(log_std) * jax.random.normal(k_a, mean.shape)
             env_state, next_obs, done, info = env_step(env_state, a.reshape(N, D, 2), jax.random.split(k_e, N))
             tr = {
                 "obs": obs, "action": a, "logp": gauss_logp(a, mean, log_std), "value": v,
@@ -160,11 +224,10 @@ def make_train(args: Args, cfg: SheepdogConfig):
 
         (env_state, obs, key), tr = jax.lax.scan(rollout_step, (c["env_state"], c["obs"], c["key"]), None, T)
 
-        # 2. Intrinsic reward = RND error on the next state (after an auto-reset this is the
-        #    fresh episode's first state; episodes are >= tens of steps, so we ignore that).
-        rnd_x = tr["next_obs"][..., :rnd_in]
-        r_raw = rnd_error(c["rnd_pred"], c["rnd_target"], rnd_x)  # (T, N)
-        rew_stats = update_stats(c["rew_stats"], r_raw)
+        # 2. Intrinsic reward, zero on auto-reset transitions.
+        valid = (~tr["done"]).astype(jnp.float32)
+        r_raw = bonus_error(c["bonus_train"], c["bonus_fixed"], tr["obs"], tr["action"], tr["next_obs"]) * valid
+        rew_stats = update_stats(c["rew_stats"], r_raw, valid)
         r = r_raw / jnp.sqrt(rew_stats[1] + 1e-8)
 
         # 3. Non-episodic GAE (intrinsic returns ignore episode boundaries).
@@ -178,36 +241,43 @@ def make_train(args: Args, cfg: SheepdogConfig):
 
         _, adv = jax.lax.scan(gae_step, (jnp.zeros(N), last_v), (r, tr["value"]), reverse=True)
         batch = {
-            "obs": tr["obs"], "action": tr["action"], "logp": tr["logp"],
-            "adv": adv, "ret": adv + tr["value"], "rnd_x": rnd_x,
+            "obs": tr["obs"], "action": tr["action"], "logp": tr["logp"], "adv": adv,
+            "ret": adv + tr["value"], "next_obs": tr["next_obs"], "valid": valid,
         }  # fmt: skip
         batch = jax.tree.map(lambda x: x.reshape(T * N, *x.shape[2:]), batch)
 
-        # 4. PPO + RND predictor updates on shuffled minibatches.
+        # 4. PPO + bonus-model updates on shuffled minibatches.
         def epoch(carry, _):
-            params, opt_state, pred, rnd_opt_state, key = carry
+            params, opt_state, b_train, b_opt_state, key = carry
             key, k = jax.random.split(key)
             perm = jax.random.permutation(k, T * N)
             mbs = jax.tree.map(lambda x: x[perm].reshape(args.num_minibatches, -1, *x.shape[1:]), batch)
 
             def mb_step(carry, mb):
-                params, opt_state, pred, rnd_opt_state = carry
-                (loss, aux), g = jax.value_and_grad(ppo_loss, has_aux=True)(params, mb)
+                params, opt_state, b_train, b_opt_state = carry
+                (_, aux), g = jax.value_and_grad(ppo_loss, has_aux=True)(params, mb)
                 upd, opt_state = opt.update(g, opt_state, params)
                 params = optax.apply_updates(params, upd)
-                rnd_loss, rg = jax.value_and_grad(lambda p: rnd_error(p, c["rnd_target"], mb["rnd_x"]).mean())(pred)
-                rupd, rnd_opt_state = rnd_opt.update(rg, rnd_opt_state, pred)
-                pred = optax.apply_updates(pred, rupd)
-                return (params, opt_state, pred, rnd_opt_state), (*aux, rnd_loss)
+                b_loss, bg = jax.value_and_grad(bonus_loss)(b_train, c["bonus_fixed"], mb)
+                bupd, b_opt_state = bonus_opt.update(bg, b_opt_state, b_train)
+                b_train = optax.apply_updates(b_train, bupd)
+                return (params, opt_state, b_train, b_opt_state), (*aux, b_loss)
 
-            (params, opt_state, pred, rnd_opt_state), stats = jax.lax.scan(
-                mb_step, (params, opt_state, pred, rnd_opt_state), mbs
+            (params, opt_state, b_train, b_opt_state), stats = jax.lax.scan(
+                mb_step, (params, opt_state, b_train, b_opt_state), mbs
             )
-            return (params, opt_state, pred, rnd_opt_state, key), stats
+            return (params, opt_state, b_train, b_opt_state, key), stats
 
-        (params, opt_state, pred, rnd_opt_state, key), (pg, vl, ent, rnd_loss) = jax.lax.scan(
-            epoch, (c["params"], c["opt_state"], c["rnd_pred"], c["rnd_opt_state"], key), None, args.update_epochs
-        )
+        if args.random_policy:
+            params, opt_state, b_train, b_opt_state = c["params"], c["opt_state"], c["bonus_train"], c["bonus_opt_state"]
+            pg = vl = ent = b_loss = jnp.zeros(1)
+        else:
+            (params, opt_state, b_train, b_opt_state, key), (pg, vl, ent, b_loss) = jax.lax.scan(
+                epoch,
+                (c["params"], c["opt_state"], c["bonus_train"], c["bonus_opt_state"], key),
+                None,
+                args.update_epochs,
+            )
 
         # 5. Diagnostics (not used for training).
         n_done = tr["done"].sum()
@@ -216,19 +286,21 @@ def make_train(args: Args, cfg: SheepdogConfig):
         sheep_xy = pos[..., 2 * D : 2 * (D + S)].reshape(T, N, S, 2)
         no_reset = ~tr["done"].any(0)  # envs without an episode boundary in this segment
         moved = lambda xy: (jnp.linalg.norm(xy[-1] - xy[0], axis=-1).mean(-1) * no_reset).sum() / jnp.maximum(no_reset.sum(), 1)  # noqa: E731
+        dog_sheep_dist = jnp.linalg.norm(dog_xy[:, :, :, None, :] - sheep_xy[:, :, None, :, :], axis=-1)  # (T,N,D,S)
         metrics = {
-            "r_int": r_raw.mean(),
-            "rnd_loss": rnd_loss.mean(),
+            "r_int": r_raw.sum() / jnp.maximum(valid.sum(), 1),
+            "bonus_loss": b_loss.mean(),
             "pg_loss": pg.mean(),
             "v_loss": vl.mean(),
             "act_std": jnp.exp(params["log_std"]).mean(),
             "episodes": n_done,
             "successes": (tr["done"] & tr["success"]).sum(),
+            "near": (dog_sheep_dist < cfg.flee_radius).any(axis=(2, 3)).mean(),
             "dog_mv": moved(dog_xy),
             "sheep_mv": moved(sheep_xy),
         }
         new_c = {
-            **c, "params": params, "opt_state": opt_state, "rnd_pred": pred, "rnd_opt_state": rnd_opt_state,
+            **c, "params": params, "opt_state": opt_state, "bonus_train": b_train, "bonus_opt_state": b_opt_state,
             "env_state": env_state, "obs": obs, "rew_stats": rew_stats, "key": key,
         }  # fmt: skip
         return new_c, metrics
@@ -236,8 +308,8 @@ def make_train(args: Args, cfg: SheepdogConfig):
     return init, update, policy
 
 
-def record_episodes(cfg, policy, params, key, n):
-    """Roll out the trained (stochastic) policy without auto-reset; return viz-compatible dicts."""
+def record_episodes(cfg, policy, params, key, n, random_policy=False):
+    """Roll out the (stochastic) policy without auto-reset; return viz-compatible dicts."""
 
     @jax.jit
     def episode(key):
@@ -247,7 +319,10 @@ def record_episodes(cfg, policy, params, key, n):
         def f(s, k):
             k_a, k_s = jax.random.split(k)
             mean, log_std, _ = policy(params, E.flat_obs(cfg, s))
-            a = mean + jnp.exp(log_std) * jax.random.normal(k_a, mean.shape)
+            if random_policy:
+                a = jax.random.uniform(k_a, mean.shape, minval=-1.0, maxval=1.0)
+            else:
+                a = mean + jnp.exp(log_std) * jax.random.normal(k_a, mean.shape)
             s2 = E.step(cfg, s, a, k_s)
             return s2, (s2, E.is_success(cfg, s2))
 
@@ -270,15 +345,21 @@ def record_episodes(cfg, policy, params, key, n):
     return trajs
 
 
-def main():
+def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for f in fields(Args):
-        p.add_argument(f"--{f.name.replace('_', '-')}", type=type(f.default), default=f.default)
+        flag = f"--{f.name.replace('_', '-')}"
+        if isinstance(f.default, bool):
+            p.add_argument(flag, action="store_true", default=f.default)
+        else:
+            p.add_argument(flag, type=type(f.default), default=f.default)
     p.add_argument("--env", nargs="*", default=[], metavar="KEY=VALUE",
                    help="SheepdogConfig overrides, e.g. --env noise_std=0 n_sheep=3")  # fmt: skip
     ns = vars(p.parse_args())
     env_overrides = ns.pop("env")
     args = Args(**ns)
+    if args.bonus not in BONUSES:
+        p.error(f"--bonus must be one of {BONUSES}")
     cfg_types = {f.name: f.type for f in fields(SheepdogConfig)}
     overrides = {}
     for kv in env_overrides:
@@ -286,9 +367,13 @@ def main():
         if k not in cfg_types:
             p.error(f"unknown env parameter {k!r}; choose from {sorted(cfg_types)}")
         overrides[k] = (int if cfg_types[k] in (int, "int") else float)(v)
-    cfg = SheepdogConfig(**overrides)
+    return args, SheepdogConfig(**overrides)
 
-    run_dir = Path(args.out) / time.strftime("%Y%m%d-%H%M%S")
+
+def main():
+    args, cfg = parse_args()
+    tag = "random" if args.random_policy else args.bonus
+    run_dir = Path(args.out) / f"{tag}-{time.strftime('%Y%m%d-%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "args.json").write_text(json.dumps({"args": asdict(args), "env": asdict(cfg)}, indent=2))
     print(f"devices: {jax.devices()}\nrun dir: {run_dir}")
@@ -318,17 +403,19 @@ def main():
                 writer.writerow(row)
                 fh.flush()
                 print(
-                    f"[{i:4d}/{n_updates}] steps {steps / 1e6:6.1f}M  sps {row['sps']:>8,}  "
-                    f"r_int {m['r_int']:.4f}  rnd {m['rnd_loss']:.4f}  v {m['v_loss']:.3f}  "
-                    f"std {m['act_std']:.2f}  dog_mv {m['dog_mv']:.2f}  sheep_mv {m['sheep_mv']:.2f}  "
-                    f"eps {int(m['episodes']):5d}  success {m['success']:.3f}"
+                    f"[{i:4d}/{n_updates}] {steps / 1e6:5.1f}M  sps {row['sps']:>8,}  "
+                    f"r_int {m['r_int']:.4f}  bonus {m['bonus_loss']:.4f}  v {m['v_loss']:.3f}  "
+                    f"std {m['act_std']:.2f}  near {m['near']:.3f}  dog_mv {m['dog_mv']:.2f}  "
+                    f"sheep_mv {m['sheep_mv']:.2f}  eps {int(m['episodes']):5d}  success {m['success']:.3f}"
                 )
 
     params = jax.device_get(c["params"])
     with open(run_dir / "params.pkl", "wb") as fh:
         pickle.dump(params, fh)
 
-    trajs = record_episodes(cfg, policy, params, jax.random.key(args.seed + 1), args.n_eval_episodes)
+    trajs = record_episodes(
+        cfg, policy, params, jax.random.key(args.seed + 1), args.n_eval_episodes, args.random_policy
+    )
     try:
         from sheepdog.viz import animate, plot_trajectory
     except ImportError:
