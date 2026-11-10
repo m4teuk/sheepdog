@@ -7,6 +7,9 @@ Full state observed, no rendering in the env. Run tests with `uv run --extra viz
 - `src/sheepdog/dynamics.py`: pure simulation core `(cfg, state, action, rng) -> state`. Keep it
   pure and vectorized: it will be ported to JAX to run batched on the GPU.
 - `src/sheepdog/env.py`: thin Gymnasium wrapper (`SheepdogEnv`, id `Sheepdog-v0`).
+- `src/sheepdog/jax_env.py`: JAX port of `dynamics.py` (reset/step/step_autoreset/flat_obs), for batched
+  GPU training. Keep the two in sync; `tests/test_jax_env.py` checks they match with noise off.
+- `scripts/rnd_ppo.py`: first URL baseline, PPO on an RND novelty reward only. Outputs to `outputs/rnd_ppo/<run>/`.
 - `src/sheepdog/viz.py` (opt-in, `viz` extra): `record` an episode, then `plot_trajectory` (PNG) / `animate` (GIF).
   Demo: `uv run --extra viz scripts/visualize.py`; outputs go to `outputs/` (gitignored).
 
