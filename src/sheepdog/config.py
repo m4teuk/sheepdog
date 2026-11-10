@@ -28,7 +28,7 @@ class SheepdogConfig:
 
     # Goal
     goal_radius: float = 1.0  # success when every sheep is within this distance of the goal
-    min_start_sheep_goal_dist: float = 3.0  # keeps episodes from starting solved
+    min_start_sheep_goal_dist: float = 1.5  # keeps episodes from starting solved
 
     def __post_init__(self):
         if self.n_dogs < 1 or self.n_sheep < 1:

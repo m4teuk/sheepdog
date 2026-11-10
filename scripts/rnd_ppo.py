@@ -5,11 +5,12 @@ state to features; a predictor network learns to match them; the prediction erro
 rarely seen states) is the reward. Intrinsic returns are non-episodic, as in the RND paper.
 
 Logged diagnostics (not used for training):
-  success  - fraction of finished episodes that ended because the sheep reached the goal
+  success  - of all episodes finished since the last log line, the fraction that ended at the goal
   sheep_mv / dog_mv - how far sheep / dog moved over one rollout segment (arena units)
 
 Run on a GPU node:
     uv run --extra viz python scripts/rnd_ppo.py
+    uv run --extra viz python scripts/rnd_ppo.py --env noise_std=0 n_sheep=3   # env overrides
 Outputs (metrics.csv, params.pkl, example episodes as .npz/.png/.gif) go to outputs/rnd_ppo/<run>/.
 """
 
@@ -51,9 +52,6 @@ class Args:
     # RND
     rnd_lr: float = 3e-4
     rnd_dim: int = 128
-    # env
-    n_sheep: int = 1
-    flocking: float = 0.0
     # output
     log_every: int = 5
     n_eval_episodes: int = 4
@@ -225,7 +223,7 @@ def make_train(args: Args, cfg: SheepdogConfig):
             "v_loss": vl.mean(),
             "act_std": jnp.exp(params["log_std"]).mean(),
             "episodes": n_done,
-            "success": (tr["done"] & tr["success"]).sum() / jnp.maximum(n_done, 1),
+            "successes": (tr["done"] & tr["success"]).sum(),
             "dog_mv": moved(dog_xy),
             "sheep_mv": moved(sheep_xy),
         }
@@ -276,8 +274,19 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     for f in fields(Args):
         p.add_argument(f"--{f.name.replace('_', '-')}", type=type(f.default), default=f.default)
-    args = Args(**vars(p.parse_args()))
-    cfg = SheepdogConfig(n_sheep=args.n_sheep, flocking_strength=args.flocking)
+    p.add_argument("--env", nargs="*", default=[], metavar="KEY=VALUE",
+                   help="SheepdogConfig overrides, e.g. --env noise_std=0 n_sheep=3")  # fmt: skip
+    ns = vars(p.parse_args())
+    env_overrides = ns.pop("env")
+    args = Args(**ns)
+    cfg_types = {f.name: f.type for f in fields(SheepdogConfig)}
+    overrides = {}
+    for kv in env_overrides:
+        k, v = kv.split("=", 1)
+        if k not in cfg_types:
+            p.error(f"unknown env parameter {k!r}; choose from {sorted(cfg_types)}")
+        overrides[k] = (int if cfg_types[k] in (int, "int") else float)(v)
+    cfg = SheepdogConfig(**overrides)
 
     run_dir = Path(args.out) / time.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -291,10 +300,16 @@ def main():
     with open(run_dir / "metrics.csv", "w", newline="") as fh:
         writer = None
         t0 = time.time()
+        win_eps = win_succ = 0  # episode counts since the last log line
         for i in range(1, n_updates + 1):
             c, m = update(c)
+            m = {k: float(v) for k, v in jax.device_get(m).items()}
+            win_eps += m.pop("episodes")
+            win_succ += m.pop("successes")
             if i % args.log_every == 0 or i == 1 or i == n_updates:
-                m = {k: float(v) for k, v in jax.device_get(m).items()}
+                m["episodes"] = win_eps
+                m["success"] = win_succ / max(win_eps, 1)
+                win_eps = win_succ = 0
                 steps = i * args.num_envs * args.num_steps
                 row = {"update": i, "steps": steps, "sps": int(steps / (time.time() - t0)), **m}
                 if writer is None:
